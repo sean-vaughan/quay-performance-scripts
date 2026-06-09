@@ -8,6 +8,7 @@ import sys
 import json
 import uuid
 import hashlib
+import re
 import multiprocessing as mp
 from endpoints.users import Users
 from endpoints.repositories import Repositories
@@ -246,16 +247,37 @@ def podman_create(tags, custom_build_image="", concurrency=4):
 
 def get_auth_token(registry, repository, username=None, password=None):
     """
-    Get authentication token from registry.
+    Get authentication token from registry following the OCI/Docker registry
+    authentication flow used by Podman and CRI-O: GET /v2/ returns a 401 with
+    a WWW-Authenticate challenge whose realm specifies the token endpoint.
+    The auth endpoint is not assumed to be co-located with the registry.
     """
-    auth_url = f"https://{registry}/v2/auth?service={registry}&scope=repository:{repository}:pull"
-    
+    # Probe /v2/ to discover the auth endpoint from the WWW-Authenticate challenge
+    auth_url = None
+    try:
+        probe = requests.get(f"https://{registry}/v2/", verify=False)
+        if probe.status_code == 401:
+            www_auth = probe.headers.get('WWW-Authenticate', '')
+            realm_match = re.search(r'realm="([^"]+)"', www_auth)
+            service_match = re.search(r'service="([^"]+)"', www_auth)
+            if realm_match:
+                realm = realm_match.group(1)
+                service = service_match.group(1) if service_match else registry
+                auth_url = f"{realm}?service={service}&scope=repository:{repository}:pull"
+                logging.debug(f"Discovered auth URL from WWW-Authenticate: {auth_url}")
+    except Exception as e:
+        logging.warning(f"Failed to probe /v2/ for auth challenge: {e}")
+
+    if not auth_url:
+        auth_url = f"https://{registry}/v2/auth?service={registry}&scope=repository:{repository}:pull"
+        logging.debug(f"Falling back to default auth URL: {auth_url}")
+
     try:
         if username and password:
             response = requests.get(auth_url, auth=(username, password), verify=False)
         else:
             response = requests.get(auth_url, verify=False)
-        
+
         response.raise_for_status()
         token = response.json().get('token')
         return token
